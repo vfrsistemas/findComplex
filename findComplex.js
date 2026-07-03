@@ -9,9 +9,15 @@ function findComplex(model) {
   this.model = model;
 }
 
-findComplex.prototype.operators = ['=', '!=', '>', '>=', '<', '<=', '->', '->>', '?', 'BETWEEN', 'NOT BETWEEN', 'IN', 'NOT IN', 'LIKE', 'NOT LIKE', 'ILIKE', 'NOT ILIKE', 'IS NULL', 'IS NOT NULL',
+findComplex.prototype.operators = ['=', '!=', '>', '>=', '<', '<=', '->', '->>', '?', '@>', '<@', 'BETWEEN', 'NOT BETWEEN', 'IN', 'NOT IN', 'LIKE', 'NOT LIKE', 'ILIKE', 'NOT ILIKE', 'IS NULL', 'IS NOT NULL',
   'IS FALSE', 'IS NOT FALSE', 'IS TRUE', 'IS NOT TRUE', 'IS UNKNOWN', 'IS NOT UNKNOWN', 'SIMILAR TO', 'NOT SIMILAR TO', 'AND', 'OR'
 ];
+// jsonb containment operators whose right-hand value is a JSON document bound as
+// a parameter and cast to jsonb. (The key-existence operators ?, ?| and ?& are
+// intentionally excluded: their literal '?' collides with the connector's '?'
+// placeholder substitution. Use @> against a single-key object instead, e.g.
+// ['col', '@>', '{"key": value}'].)
+findComplex.prototype.jsonbValueOperators = ['@>', '<@'];
 findComplex.prototype.joinTypes = ['INNER JOIN', 'RIGHT JOIN', 'LEFT JOIN', 'FULL OUTER JOIN'];
 findComplex.prototype.sortOrder = ['ASC', 'DESC', 'NULLS FIRST', 'NULLS LAST'];
 findComplex.prototype.castTypes = ['NUMERIC', 'SMALLINT', 'INT2', 'INTEGER', 'INT', 'INT4', 'BIGINT', 'INT8', 'REAL', 'FLOAT4', 'DOUBLE PRECISION', 'FLOAT8',
@@ -178,6 +184,7 @@ findComplex.prototype.createCondition = function (data, alias, parentParams, par
   var sqlCondition = ParameterizedSQL('', []);
   var isValue = false;
   var isJson = false;
+  var jsonbValue = false;
   data.forEach(function (field, index) {
     if (Object.prototype.toString.call(field) === '[object Array]') {
       if (typeof data[index - 1] == 'string') {
@@ -196,6 +203,13 @@ findComplex.prototype.createCondition = function (data, alias, parentParams, par
           tmp = that.buildInClause(field);
           sqlCondition = ParameterizedSQL.append(sqlCondition, tmp);
           isValue = false;
+          break;
+        case '@>':
+        case '<@':
+          tmp = ParameterizedSQL('?::jsonb', [JSON.stringify(field)]);
+          sqlCondition = ParameterizedSQL.append(sqlCondition, tmp);
+          isValue = false;
+          jsonbValue = false;
           break;
         default:
           tmp = that.createCondition(field, alias);
@@ -234,14 +248,24 @@ findComplex.prototype.createCondition = function (data, alias, parentParams, par
             } else if (operator == '->' || operator == '->>' || operator == '?') {
               isValue = false;
               isJson = true;
+            } else if (that.jsonbValueOperators.indexOf(operator) != -1) {
+              isValue = true;
+              jsonbValue = operator;
             } else {
               isValue = true;
             }
           } else {
             value = field;
-            tmp = ParameterizedSQL('?', [value]);
+            if (jsonbValue == '@>' || jsonbValue == '<@') {
+              tmp = ParameterizedSQL('?::jsonb', [value]);
+            } else if (jsonbValue == '?|' || jsonbValue == '?&') {
+              tmp = ParameterizedSQL('?::text[]', [value]);
+            } else {
+              tmp = ParameterizedSQL('?', [value]);
+            }
             sqlCondition = sqlCondition.merge(tmp);
             isValue = false;
+            jsonbValue = false;
           }
         }
       }
@@ -364,7 +388,7 @@ findComplex.prototype.sqlSubquery = function (params) {
 
     if (params.sublevels > 0 && params.childAlias) {
       for (const child of params.childAlias) {
-        wholeObj = wholeObj + ' || jsonb_build_object(' + '\'' + child + '\',' + child + ') '
+        wholeObj = wholeObj + ' || jsonb_build_object(' + '\'' + child.jsonKey + '\',' + child.sqlAlias + ') '
       }
     }
 
@@ -449,6 +473,34 @@ findComplex.prototype.translateJoin = function (join, method = 'LATERAL', parent
 
         if (children) {
           children.splice(children.findIndex(t => t === '$relation'), 1);
+          // Resolve each child key to its case-preserved JSON output name and
+          // its unique SQL alias, so nested relations render with the correct
+          // key (e.g. "usuarioColeta") and reference the right subquery.
+          var childSource = join[alias] || join[subJoin.relation];
+          children = children.map(function (childKey) {
+            var childRel = null;
+            childSource.forEach(function (entry) {
+              // if (entry && entry[childKey] && entry[childKey]['$relation']) {
+              //   childRel = entry[childKey]['$relation'];
+                // }
+              if (!entry || !entry[childKey]) return;
+              var childNode = entry[childKey];
+              // childNode is the joinData bucket for this child: an array whose
+              // first element is { '$relation': childJoin }. Fall back to the
+              // plain-object shape just in case.
+              if (Array.isArray(childNode)) {
+                if (childNode[0] && childNode[0]['$relation']) {
+                  childRel = childNode[0]['$relation'];
+                }
+              } else if (childNode['$relation']) {
+                childRel = childNode['$relation'];
+              }
+            });
+            return {
+              jsonKey: childRel ? childRel.jsonKey : childKey,
+              sqlAlias: childRel ? childRel.alias : childKey
+            };
+          });
         }
 
         switch (subJoin.relationData.type) {
@@ -782,6 +834,24 @@ findComplex.prototype.createGroupBy = function (join) {
   }
 };
 
+// Build a unique SQL identifier for a join by namespacing the caller-supplied
+// key under its parent's SQL alias. This keeps SQL aliases distinct even when
+// the same relation key is reused at different nesting levels (e.g. exame ->
+// exame), while the original key is preserved separately as the JSON output
+// name. PostgreSQL identifiers are capped at 63 bytes, so overly long names are
+// truncated with a short deterministic suffix to avoid accidental clashes.
+findComplex.prototype.buildSqlAlias = function (parentAlias, key) {
+  var base = (parentAlias == null || parentAlias === this.modelName) ? key : parentAlias + '_' + key;
+  if (base.length <= 63) {
+    return base;
+  }
+  var suffix = 0;
+  for (var i = 0; i < base.length; i++) {
+    suffix = (suffix * 31 + base.charCodeAt(i)) % 100000;
+  }
+  return base.slice(0, 57) + '_' + suffix;
+};
+
 findComplex.prototype.createJoins = function (include, modelName, firstPass = true, parentAlias = null, level, sublevel = 0) {
   that = this;
   var joinData = {};
@@ -823,7 +893,15 @@ findComplex.prototype.createJoins = function (include, modelName, firstPass = tr
         } else {
           join.parentJoin = subData['$relation']['parentJoin'];
         }
-        join.alias = alias;
+        // The object key (`alias`) is what the caller wants to see in the
+        // returned JS object (e.g. "usuarioColeta"). PostgreSQL folds unquoted
+        // identifiers to lower case, so we keep the original key separately as
+        // the JSON output name and build a distinct, unique SQL alias for use
+        // as a real SQL identifier. This also decouples the SQL identifier from
+        // the object key, so two nested relations reusing the same key (e.g.
+        // exame -> exame) no longer collide in the generated SQL.
+        join.jsonKey = alias;
+        join.alias = that.buildSqlAlias(parentAlias, alias);
         join.parentAlias = parentAlias;
         join.relation = subData[subAlias].name;
         join.relationData = relationData[join.relation];
@@ -850,13 +928,13 @@ findComplex.prototype.createJoins = function (include, modelName, firstPass = tr
         join = that.createOrderBy(join);
         join.groupBy = that.createGroupBy(join);
         if ((Object.prototype.toString.call(subData[subAlias].having) == '[object Array]') ? subData[subAlias].having.length != 0 : false) {
-          join.having = that.createCondition(subData[subAlias].having, alias);
+          join.having = that.createCondition(subData[subAlias].having, join.alias);
         } else {
           join.having = null;
         }
         var where = subData[subAlias].where;
         if ((Object.prototype.toString.call(where) == '[object Array]') ? where.length != 0 : false) {
-          tmpWhere = that.createCondition(where, alias);
+          tmpWhere = that.createCondition(where, join.alias);
           tmpWhere.sql = '(' + tmpWhere.sql + ')';
           join.where = tmpWhere;
         } else {
@@ -886,7 +964,7 @@ findComplex.prototype.createJoins = function (include, modelName, firstPass = tr
         childData[subAlias] = include[alias][subAlias];
         childData[subAlias]['$relation']['parentJoin'] = joinData[alias][0]['$relation'];
         if (typeof joinData[alias] == 'undefined') joinData[alias] = [];
-        joinData[alias].push(that.createJoins(childData, modelName, false, alias, level, sublevel));
+        joinData[alias].push(that.createJoins(childData, modelName, false, joinData[alias][0]['$relation'].alias, level, sublevel));
         sublevel += 1;
       }
     }
@@ -908,7 +986,7 @@ findComplex.prototype.generateQuery = function (select, where, order, offset, li
   mainSql.sql = this.createMainSelect(select);
   joinSqls.forEach(function (join) {
     if (join.data.ignore != true) {
-      mainSql.sql = mainSql.sql + ',' + join.data.alias + '.' + join.data.alias + ' AS ' + join.data.alias;
+      mainSql.sql = mainSql.sql + ',' + join.data.alias + '.' + join.data.alias + ' AS "' + join.data.jsonKey + '"';
     }
   });
   mainSql.sql = mainSql.sql + ' from ' + this.schema + '.' + this.modelTable + ' AS ' + this.modelName;
